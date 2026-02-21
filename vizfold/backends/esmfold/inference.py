@@ -181,27 +181,19 @@ class ESMFoldRunner:
         if attention_mask is not None:
             attention_mask = attention_mask.to(device=self.device)
 
-        with torch.no_grad():
-            kwargs = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "output_attentions": want_attn,
-                "output_hidden_states": want_act,
-            }
-            out = model(**kwargs)
-
-        got_attn, got_act = collector.try_use_outputs(out, "esmfold")
-        if (want_attn and not got_attn) or (want_act and not got_act):
-            # Capture from ESM trunk (model.esm) via hooks
+        # HF EsmForProteinFolding does NOT accept output_attentions / output_hidden_states.
+        # For traces we use hooks on model.esm; for structure-only we just run forward.
+        if trace_mode != "none":
             esm_trunk = getattr(model, "esm", model)
             collector.register_hooks(esm_trunk)
-            collector.clear()
-            with torch.no_grad():
-                out = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                )
-            collector.try_use_outputs(out, "esmfold")
+
+        with torch.no_grad():
+            out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+
+        if trace_mode != "none":
             collector.remove_hooks()
 
         # Structure: PDB + optional coords tensor (HF returns dict-like or object)
