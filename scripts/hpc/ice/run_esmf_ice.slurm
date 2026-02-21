@@ -43,7 +43,7 @@ echo "Running ESMFold..."
 python run_pretrained_esmf.py \
   --fasta "$FASTA" \
   --out "$OUTDIR" \
-  --model esmfold_v1 \
+  --model facebook/esmfold_v1 \
   --device "$DEVICE" \
   --trace_mode "$TRACE_MODE" \
   --layers all \

@@ -39,6 +39,4 @@ dependencies:
       - dm-tree==0.1.6
       - git+https://github.com/NVIDIA/dllogger.git
       - flash-attn==2.6.3
-      - einops  # required by fair-esm/ESMFold
-      - omegaconf  # required by fair-esm/ESMFold
-      - fair-esm  # ESMFold backend (run_pretrained_esmf.py)
+      - transformers  # ESMFold backend (run_pretrained_esmf.py), no OpenFold build

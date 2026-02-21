@@ -1,10 +1,8 @@
 # ESMFold backend
 
-The ESMFold backend runs [ESMFold](https://github.com/facebookresearch/esm) (via `fair-esm`) and writes **VizFold-compatible** trace archives: structure + optional attention and activation tensors with metadata.
+The ESMFold backend runs [ESMFold](https://github.com/facebookresearch/esm) via **HuggingFace Transformers** (`EsmForProteinFolding`) and writes **VizFold-compatible** trace archives: structure + optional attention and activation tensors with metadata. Using Transformers avoids the OpenFold build dependency (no CUDA compilation on cluster).
 
 ## Install
-
-fair-esm does not install all ESMFold dependencies by default. Use either:
 
 **Option A – conda (recommended)**  
 Use `environment-mac.yml` (Mac) or `environment.yml` (Linux):
@@ -22,7 +20,7 @@ pip install -r requirements-esmfold.txt
 # Optional: pip install -e .  for vizfold package
 ```
 
-`requirements-esmfold.txt` includes: dm-tree, einops, omegaconf, fair-esm.
+`requirements-esmfold.txt` includes: `transformers` (and optionally `torch` if not already installed).
 
 ## Run locally
 
@@ -41,7 +39,7 @@ python run_pretrained_esmf.py \
 python run_pretrained_esmf.py \
   --fasta examples/monomer/fasta_dir_6KWC/6KWC.fasta \
   --out outputs/esmf_6KWC \
-  --model esmfold_v1 \
+  --model facebook/esmfold_v1 \
   --device cuda \
   --trace_mode attention+activations \
   --layers all \

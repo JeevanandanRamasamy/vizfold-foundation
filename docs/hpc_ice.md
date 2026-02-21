@@ -5,7 +5,7 @@ This guide covers running the ESMFold backend and trace export on an ICE cluster
 ## Prerequisites
 
 - Access to ICE with GPU nodes
-- Conda (or module environment) with PyTorch (CUDA), and `fair-esm` installed
+- Conda (or module environment) with PyTorch (CUDA), and `transformers` installed
 
 ## Environment
 
@@ -15,7 +15,7 @@ This guide covers running the ESMFold backend and trace export on an ICE cluster
 conda create -n vizfold python=3.10
 conda activate vizfold
 conda install pytorch pytorch-cuda=12.1 -c pytorch -c nvidia
-pip install fair-esm
+pip install transformers
 # From repo root:
 pip install -e .
 ```
@@ -95,7 +95,7 @@ export TRACE_MODE=attention
 |-------|----------------|
 | CUDA not found | Load correct `cuda` module; `nvidia-smi` on the node |
 | `torch` not seeing GPU | Install PyTorch with CUDA: `conda install pytorch pytorch-cuda=...` |
-| Missing packages | `pip install fair-esm`; run from repo root or `pip install -e .` |
+| Missing packages | `pip install transformers`; run from repo root or `pip install -e .` |
 | Disk quota | Use `OUTDIR` on scratch or project space, not home if limited |
 | Job killed (OOM) | Increase `--mem` or use shorter sequence / `--trace_mode none` |
 

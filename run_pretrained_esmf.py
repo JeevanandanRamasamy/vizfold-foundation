@@ -9,7 +9,7 @@ Example:
   python run_pretrained_esmf.py \\
     --fasta examples/monomer/fasta_dir_6KWC/6KWC.fasta \\
     --out outputs/esmf_6KWC \\
-    --model esmfold_v1 \\
+    --model facebook/esmfold_v1 \\
     --device cuda \\
     --trace_mode attention+activations \\
     --layers all \\
@@ -40,8 +40,8 @@ def main() -> int:
     parser.add_argument(
         "--model",
         type=str,
-        default="esmfold_v1",
-        help="Model name (e.g. esmfold_v1).",
+        default="facebook/esmfold_v1",
+        help="HuggingFace model id (e.g. facebook/esmfold_v1).",
     )
     parser.add_argument(
         "--device",

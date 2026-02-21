@@ -2,7 +2,7 @@
 Smoke test for ESMFold backend: CLI and output layout.
 
 Runs in CPU mode on a tiny sequence so CI stays fast.
-Skips actual ESMFold inference if fair-esm is not installed.
+Skips actual ESMFold inference if transformers is not installed.
 
 Run with: pytest tests/test_esmf_smoke.py -v
 Or without pytest: python tests/test_esmf_smoke.py
@@ -26,22 +26,22 @@ except ImportError:
 
 def _has_esm() -> bool:
     try:
-        import esm  # noqa: F401
+        from transformers import EsmForProteinFolding  # noqa: F401
         return True
     except ImportError:
         return False
 
 
 def test_esmf_import():
-    """Backend and runner can be imported when fair-esm is present."""
+    """Backend and runner can be imported when transformers is present."""
     if not _has_esm():
-        return  # skip when no fair-esm
+        return  # skip when no transformers
     from vizfold.backends.esmfold.inference import ESMFoldRunner
     from vizfold.backends.esmfold.schema import build_meta, write_meta
     assert ESMFoldRunner is not None
     meta = build_meta(
         backend="esmfold",
-        model_name="esmfold_v1",
+        model_name="facebook/esmfold_v1",
         out_dir="/tmp",
         fasta_path=None,
         device="cpu",
@@ -94,7 +94,7 @@ def test_esmf_smoke_run_cpu(tmp_path=None):
     Kept minimal so it stays under a few minutes.
     """
     if not _has_esm():
-        return  # skip when no fair-esm
+        return  # skip when no transformers
     if tmp_path is None:
         tmp_path = Path(tempfile.mkdtemp())
     fasta = tmp_path / "tiny.fasta"
@@ -128,8 +128,8 @@ def test_esmf_smoke_run_cpu(tmp_path=None):
 
 # Pytest decorators when available
 if pytest is not None:
-    test_esmf_import = pytest.mark.skipif(not _has_esm(), reason="fair-esm not installed")(test_esmf_import)
-    test_esmf_smoke_run_cpu = pytest.mark.skipif(not _has_esm(), reason="fair-esm not installed")(test_esmf_smoke_run_cpu)
+    test_esmf_import = pytest.mark.skipif(not _has_esm(), reason="transformers not installed")(test_esmf_import)
+    test_esmf_smoke_run_cpu = pytest.mark.skipif(not _has_esm(), reason="transformers not installed")(test_esmf_smoke_run_cpu)
 
 
 if __name__ == "__main__":
@@ -166,7 +166,7 @@ if __name__ == "__main__":
     except Exception as e:
         print("FAIL", e)
         failed.append("test_schema_build_meta")
-    # ESMFold import (when fair-esm present)
+    # ESMFold import (when transformers present)
     print("test_esmf_import ...", end=" ")
     try:
         test_esmf_import()
@@ -174,7 +174,7 @@ if __name__ == "__main__":
     except Exception as e:
         print("FAIL", e)
         failed.append("test_esmf_import")
-    # Full smoke run (when fair-esm present)
+    # Full smoke run (when transformers present)
     print("test_esmf_smoke_run_cpu ...", end=" ")
     try:
         test_esmf_smoke_run_cpu()

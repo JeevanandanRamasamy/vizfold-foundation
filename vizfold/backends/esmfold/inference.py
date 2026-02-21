@@ -1,7 +1,7 @@
 """
 ESMFold inference: load model, run forward, optionally extract traces.
 
-Uses fair-esm (esm.pretrained.esmfold_v1) when available.
+Uses HuggingFace Transformers (EsmForProteinFolding) to avoid OpenFold build dependency.
 """
 import os
 import sys
@@ -19,18 +19,27 @@ from vizfold.backends.esmfold.trace_adapter import (
     write_trace_summary,
 )
 
-# Optional: fair-esm
+# HuggingFace ESMFold
 try:
-    import esm
-    from esm.pretrained import esmfold_v1
+    from transformers import AutoTokenizer, EsmForProteinFolding
     HAS_ESM = True
 except ImportError:
     HAS_ESM = False
-    esm = None
-    esmfold_v1 = None
+    AutoTokenizer = None  # type: ignore
+    EsmForProteinFolding = None  # type: ignore
+
+# PDB conversion (bundled in transformers)
+def _get_pdb_utils():
+    try:
+        from transformers.models.esm.openfold_utils.feats import atom14_to_atom37
+        from transformers.models.esm.openfold_utils.protein import Protein as OFProtein, to_pdb
+        return atom14_to_atom37, OFProtein, to_pdb
+    except ImportError:
+        return None, None, None
 
 
 LONG_SEQ_WARN_THRESHOLD = 400  # N^2 attention warning
+HF_MODEL_DEFAULT = "facebook/esmfold_v1"
 
 
 def _parse_layers_arg(layers_arg: Optional[str]) -> Optional[List[int]]:
@@ -67,12 +76,12 @@ class ESMFoldRunner:
     """
     Runs ESMFold inference and writes VizFold-compatible output.
 
-    Not a full BackendBase implementation; used by run_pretrained_esmf.py.
+    Uses HuggingFace EsmForProteinFolding (no fair-esm / OpenFold build).
     """
 
     def __init__(
         self,
-        model_name: str = "esmfold_v1",
+        model_name: str = HF_MODEL_DEFAULT,
         device: str = "cpu",
         dtype: Optional[str] = None,
         seed: Optional[int] = None,
@@ -80,7 +89,7 @@ class ESMFoldRunner:
     ):
         if not HAS_ESM:
             raise RuntimeError(
-                "ESMFold backend requires fair-esm. Install with: pip install fair-esm"
+                "ESMFold backend requires transformers. Install with: pip install transformers torch"
             )
         self.model_name = model_name
         self.device = device
@@ -88,7 +97,7 @@ class ESMFoldRunner:
         self.seed = seed
         self.deterministic = deterministic
         self._model = None
-        self._alphabet = None
+        self._tokenizer = None
 
     def load_model(self) -> Any:
         if self._model is not None:
@@ -96,17 +105,19 @@ class ESMFoldRunner:
         if self.seed is not None:
             torch.manual_seed(self.seed)
         if self.deterministic:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
+            try:
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+            except Exception:
+                pass
             warnings.warn("Deterministic mode may reduce speed.", UserWarning)
 
-        model, alphabet = esmfold_v1()
-        self._alphabet = alphabet
-        model = model.eval()
-        dtype = torch.float16 if self.dtype == "float16" else torch.float32
-        model = model.to(device=self.device, dtype=dtype)
-        self._model = model
-        return model
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self._model = EsmForProteinFolding.from_pretrained(self.model_name)
+        self._model = self._model.eval()
+        dtype_t = torch.float16 if self.dtype == "float16" else torch.float32
+        self._model = self._model.to(device=self.device, dtype=dtype_t)
+        return self._model
 
     def run(
         self,
@@ -145,6 +156,7 @@ class ESMFoldRunner:
             )
 
         model = self.load_model()
+        tokenizer = self._tokenizer
         want_attn = "attention" in trace_mode
         want_act = "activations" in trace_mode
         layer_list = _parse_layers_arg(layers)
@@ -157,55 +169,107 @@ class ESMFoldRunner:
             head_indices=head_list,
         )
 
-        # Try model forward with optional outputs
+        # Tokenize: single sequence, no special tokens (per HF ESMFold usage)
+        inputs = tokenizer(
+            [seq],
+            return_tensors="pt",
+            add_special_tokens=False,
+            padding=False,
+        )
+        input_ids = inputs["input_ids"].to(device=self.device)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device=self.device)
+
         with torch.no_grad():
-            # ESMFold in fair-esm: tokenize with model's alphabet
-            alphabet = self._alphabet
-            if alphabet is None:
-                alphabet = esm.Alphabet.from_architecture("ESM-1b")
-            batch_converter = alphabet.get_batch_converter()
-            _, _, batch_tokens = batch_converter([(seq_id, seq)])
-            batch_tokens = batch_tokens.to(device=self.device)
+            kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "output_attentions": want_attn,
+                "output_hidden_states": want_act,
+            }
+            out = model(**kwargs)
 
-            kwargs = {}
-            if hasattr(model, "forward"):
-                sig = getattr(model.forward, "__wrapped__", model.forward)
-                try:
-                    import inspect
-                    params = inspect.signature(model.forward).parameters
-                    if "output_attentions" in params:
-                        kwargs["output_attentions"] = want_attn
-                    if "output_hidden_states" in params:
-                        kwargs["output_hidden_states"] = want_act
-                except Exception:
-                    pass
+        got_attn, got_act = collector.try_use_outputs(out, "esmfold")
+        if (want_attn and not got_attn) or (want_act and not got_act):
+            # Capture from ESM trunk (model.esm) via hooks
+            esm_trunk = getattr(model, "esm", model)
+            collector.register_hooks(esm_trunk)
+            collector.clear()
+            with torch.no_grad():
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+            collector.try_use_outputs(out, "esmfold")
+            collector.remove_hooks()
 
-            out = model(batch_tokens, **kwargs)
-
-            got_attn, got_act = collector.try_use_outputs(out, self.model_name)
-            if (want_attn and not got_attn) or (want_act and not got_act):
-                collector.register_hooks(model)
-                collector.clear()
-                out = model(batch_tokens)
-                collector.try_use_outputs(out, self.model_name)
-                collector.remove_hooks()
-
-        # Structure output
+        # Structure: PDB + optional coords tensor (HF returns dict-like or object)
         pdb_str = None
         coords = None
-        if hasattr(out, "positions"):
-            pos = out.positions
-            if pos is not None:
-                coords = pos
-        if hasattr(out, "to_pdb"):
+        atom14_to_atom37, OFProtein, to_pdb = _get_pdb_utils()
+
+        def _get_out(key: str):
+            if hasattr(out, key):
+                return getattr(out, key)
+            if isinstance(out, dict) and key in out:
+                return out[key]
+            return None
+
+        positions = _get_out("positions")
+        if positions is not None:
             try:
-                pdb_str = out.to_pdb(out)[0] if hasattr(out.to_pdb(out), "__getitem__") else out.to_pdb(out)
-            except Exception:
-                pass
-        if pdb_str is None and hasattr(out, "pdb_string"):
-            pdb_str = getattr(out, "pdb_string", None)
+                if atom14_to_atom37 and OFProtein is not None and to_pdb is not None:
+                    # positions: often [num_recycling, batch, N, 14, 3]; use last recycling
+                    pos = positions
+                    if pos.dim() == 5:
+                        pos = pos[-1]
+                    final_atom37 = atom14_to_atom37(pos, out)
+                    coords = final_atom37
+                    out_cpu = {}
+                    for k in ("aatype", "atom37_atom_exists", "residue_index", "plddt", "chain_index"):
+                        v = _get_out(k)
+                        if v is not None:
+                            out_cpu[k] = v.cpu().numpy() if isinstance(v, torch.Tensor) else v
+                    pos_np = final_atom37.cpu().numpy()
+                    for i in range(pos_np.shape[0]):
+                        pred = OFProtein(
+                            aatype=out_cpu["aatype"][i],
+                            atom_positions=pos_np[i],
+                            atom_mask=out_cpu["atom37_atom_exists"][i],
+                            residue_index=out_cpu["residue_index"][i] + 1,
+                            b_factors=out_cpu["plddt"][i],
+                            chain_index=out_cpu.get("chain_index", [None] * pos_np.shape[0])[i] if "chain_index" in out_cpu else None,
+                        )
+                        pdb_str = to_pdb(pred)
+                        break
+                else:
+                    pos = positions
+                    if pos.dim() == 5:
+                        pos = pos[-1, 0]
+                    elif pos.dim() == 4:
+                        pos = pos[0]
+                    coords = pos
+                    if coords.dim() == 4:
+                        ca_idx = 1
+                        coords = coords[:, :, ca_idx, :]
+                    pdb_str = _coords_to_minimal_pdb(coords[0], seq)
+            except Exception as e:
+                log(f"Warning: PDB conversion failed ({e}); writing minimal PDB if possible.")
+                if coords is not None:
+                    try:
+                        c = coords[0] if coords.dim() > 2 else coords
+                        if c.dim() == 3:
+                            c = c[:, 1, :]
+                        pdb_str = _coords_to_minimal_pdb(c, seq)
+                    except Exception:
+                        pass
+
         if pdb_str is None and coords is not None:
-            pdb_str = _coords_to_minimal_pdb(coords, seq)
+            c = coords[0] if coords.dim() > 2 else coords
+            if c.dim() == 3:
+                c = c[:, 1, :]
+            pdb_str = _coords_to_minimal_pdb(c, seq)
         if pdb_str is None:
             log("Warning: no PDB output from model; structure/ may be incomplete.")
 
