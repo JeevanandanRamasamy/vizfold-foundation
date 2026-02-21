@@ -1,0 +1,181 @@
+"""
+Writes ESMFold traces into VizFold-compatible archive layout.
+
+Layout:
+  out_dir/
+    meta.json
+    structure/
+      predicted.pdb
+      predicted.pt   (optional)
+    trace/
+      attention/
+        layer_000.pt
+        ...
+      activations/
+        layer_000.pt
+        ...
+      index.json
+    logs.txt (caller appends)
+"""
+import os
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+
+from vizfold.backends.esmfold.schema import (
+    build_meta,
+    write_meta,
+    write_trace_index,
+)
+from vizfold.backends.esmfold.hooks import ESMFoldTraceCollector
+
+
+def _save_tensor(path: str, t: torch.Tensor, save_fp16: bool = False) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if save_fp16 and t.dtype == torch.float32:
+        t = t.half()
+    torch.save(t.cpu(), path)
+
+
+def write_structure(out_dir: str, pdb_str: Optional[str], coords: Optional[torch.Tensor]) -> Dict[str, str]:
+    base = os.path.join(out_dir, "structure")
+    os.makedirs(base, exist_ok=True)
+    paths = {}
+    if pdb_str:
+        pdb_path = os.path.join(base, "predicted.pdb")
+        with open(pdb_path, "w") as f:
+            f.write(pdb_str)
+        paths["pdb"] = pdb_path
+    if coords is not None:
+        pt_path = os.path.join(base, "predicted.pt")
+        torch.save(coords.cpu(), pt_path)
+        paths["coords"] = pt_path
+    return paths
+
+
+def write_traces(
+    out_dir: str,
+    collector: ESMFoldTraceCollector,
+    save_fp16: bool = False,
+    layer_indices: Optional[list] = None,
+    head_indices: Optional[list] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Write attention and activations from collector to trace/attention/ and trace/activations/.
+    Returns (attention_index, activations_index) for index.json.
+    """
+    trace_root = os.path.join(out_dir, "trace")
+    attn_dir = os.path.join(trace_root, "attention")
+    act_dir = os.path.join(trace_root, "activations")
+    os.makedirs(attn_dir, exist_ok=True)
+    os.makedirs(act_dir, exist_ok=True)
+
+    attention_index: Dict[str, Any] = {}
+    activations_index: Dict[str, Any] = {}
+
+    for key, t in collector.attention.items():
+        path = os.path.join(attn_dir, f"{key}.pt")
+        if head_indices is not None and t.dim() >= 3:
+            t = t[:, head_indices, ...]
+        _save_tensor(path, t, save_fp16=save_fp16)
+        attention_index[key] = {
+            "path": path,
+            "dtype": str(t.dtype),
+            "shape": list(t.shape),
+        }
+
+    for key, t in collector.activations.items():
+        path = os.path.join(act_dir, f"{key}.pt")
+        _save_tensor(path, t, save_fp16=save_fp16)
+        activations_index[key] = {
+            "path": path,
+            "dtype": str(t.dtype),
+            "shape": list(t.shape),
+        }
+
+    write_trace_index(out_dir, attention_index, activations_index)
+    return attention_index, activations_index
+
+
+def write_trace_summary(
+    out_dir: str,
+    collector: "ESMFoldTraceCollector",
+) -> Optional[str]:
+    """
+    Write trace/summary.json with per-layer attention entropy, mean/std, sparsity proxy,
+    and activation norms. Cheap to compute; useful for analysis.
+    """
+    import json
+    import numpy as np
+    summary = {"attention": {}, "activations": {}}
+    for key, t in collector.attention.items():
+        a = t.float().cpu().numpy()
+        # a: [..., heads, N, N]
+        if a.size == 0:
+            continue
+        if a.ndim == 3:
+            a = a[np.newaxis, ...]
+        # Per-layer (first dim after batch) stats
+        for i in range(a.shape[0]):
+            layer_key = f"{key}_slice{i}" if a.shape[0] > 1 else key
+            block = a[i]
+            if block.ndim >= 3:
+                # heads, N, N
+                ent = -np.sum(block * np.log(block + 1e-12), axis=(-2, -1)).mean()
+                summary["attention"][layer_key] = {
+                    "mean": float(block.mean()),
+                    "std": float(block.std()),
+                    "entropy_proxy": float(ent),
+                    "sparsity_proxy": float((block < 1e-5).mean()),
+                }
+    for key, t in collector.activations.items():
+        h = t.float().cpu().numpy()
+        if h.size == 0:
+            continue
+        summary["activations"][key] = {
+            "norm_mean": float(np.sqrt((h ** 2).mean())),
+            "mean": float(h.mean()),
+            "std": float(h.std()),
+        }
+    path = os.path.join(out_dir, "trace", "summary.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(summary, f, indent=2)
+    return path
+
+
+def build_and_write_meta(
+    out_dir: str,
+    model_name: str,
+    fasta_path: str,
+    device: str,
+    dtype: str,
+    seq_len: int,
+    fasta_hash: str,
+    layer_count: int,
+    head_count: int,
+    trace_mode: str,
+    shapes_recorded: Dict[str, Any],
+    seed: Optional[int] = None,
+    deterministic: bool = False,
+    save_fp16: bool = False,
+) -> str:
+    meta = build_meta(
+        backend="esmfold",
+        model_name=model_name,
+        out_dir=out_dir,
+        fasta_path=fasta_path,
+        device=device,
+        dtype=dtype,
+        sequence_length=seq_len,
+        fasta_hash=fasta_hash,
+        layer_count=layer_count,
+        head_count=head_count,
+        trace_mode=trace_mode,
+        trace_formats=["pt"],  # VizFold trace format
+        shapes_recorded=shapes_recorded,
+        seed=seed,
+        deterministic=deterministic,
+        save_fp16=save_fp16,
+    )
+    return write_meta(meta, out_dir)
