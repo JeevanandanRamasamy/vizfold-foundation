@@ -2,12 +2,13 @@
 ESMFold inference via OpenFold model loading.
 
 Strategy:
-  1. Load the pretrained ESMFold checkpoint via fair-esm (esm.pretrained.esmfold_v1)
-  2. Patch IPA keys for VizFold/OpenFold compatibility (same as patch_esmfold.py)
-  3. Run forward pass with demo_attn=True so ATTENTION_METADATA captures attention maps
-  4. Attention is saved via the existing save_all_topk_from_recent_attention() pipeline
-     into the standard text-file format that visualization tools consume
-  5. Write structured output: structure/, meta.json, logs.txt
+  1. Download the ESMFold checkpoint via torch.hub (if not already cached)
+  2. Patch IPA keys ON DISK before loading  ← must happen first
+     fair-esm's _load_model() validates key names during load, so in-memory
+     patching after the fact is too late.
+  3. Call esm.pretrained.esmfold_v1() which now finds the patched checkpoint
+  4. Run forward pass with demo_attn=True so ATTENTION_METADATA captures attention
+  5. Write structure/, meta.json, logs.txt + attention text files
 
 Note: ESMFold does NOT have triangle attention (no pair representation). Only
 MSA row attention is available. This is an architectural difference from
@@ -37,12 +38,65 @@ logger.setLevel(logging.INFO)
 ESMFOLD_LAYER_COUNT = 48  # ESMFold v1 trunk layers
 ESMFOLD_HEAD_COUNT = 8    # heads per attention layer
 
-# IPA keys that need patching for VizFold compatibility
+# IPA keys that need patching for VizFold compatibility.
+# fair-esm downloads a checkpoint with these as `<key>.weight`,
+# but OpenFold v2 (VizFold) renamed them to `<key>.linear.weight`.
 # See: Meta ESM Issue #435
 IPA_KEYS_TO_PATCH = [
     "trunk.structure_module.ipa.linear_q_points",
     "trunk.structure_module.ipa.linear_kv_points",
 ]
+
+# Cache location where fair-esm stores the downloaded checkpoint
+ESMFOLD_CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/fair-esm/models/esmfold_3B_v1.pt"
+ESMFOLD_CHECKPOINT_NAME = "esmfold_3B_v1.pt"
+
+
+def _get_checkpoint_path() -> str:
+    """Return the path where fair-esm caches the ESMFold checkpoint."""
+    hub_dir = torch.hub.get_dir()
+    return os.path.join(hub_dir, "checkpoints", ESMFOLD_CHECKPOINT_NAME)
+
+
+def _ensure_checkpoint_patched() -> None:
+    """
+    Download the ESMFold checkpoint if needed, then patch IPA keys on disk.
+
+    This MUST be called before esm.pretrained.esmfold_v1() because fair-esm's
+    _load_model() validates that expected key names are present and raises
+    RuntimeError if they are missing — there is no way to intercept and fix
+    keys after the fact.
+
+    Idempotent: if the checkpoint is already patched, nothing is rewritten.
+    """
+    checkpoint_path = _get_checkpoint_path()
+
+    # Download if not yet cached
+    if not os.path.exists(checkpoint_path):
+        logger.info(f"Downloading ESMFold checkpoint to {checkpoint_path} ...")
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        torch.hub.download_url_to_file(
+            ESMFOLD_CHECKPOINT_URL,
+            checkpoint_path,
+            progress=True,
+        )
+
+    # Load and inspect — patch only if the OLD key format is present
+    logger.info("Checking ESMFold checkpoint IPA key format...")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt.get("model", ckpt)
+
+    needs_patch = any(
+        f"{key}.weight" in state_dict for key in IPA_KEYS_TO_PATCH
+    )
+    if not needs_patch:
+        logger.info("Checkpoint already uses VizFold-compatible key format — no patch needed.")
+        return
+
+    logger.info("Patching ESMFold checkpoint IPA keys on disk...")
+    ckpt["model"] = _patch_esmfold_state_dict(state_dict)
+    torch.save(ckpt, checkpoint_path)
+    logger.info(f"Patched checkpoint saved to {checkpoint_path}")
 
 
 def _patch_esmfold_state_dict(state_dict: dict) -> dict:
@@ -149,29 +203,22 @@ class ESMFoldRunner:
             warnings.warn("Deterministic mode may reduce speed.", UserWarning)
 
         try:
-            import esm
+            import esm  # noqa: F401 — checked before patching
         except ImportError:
             raise RuntimeError(
                 "ESMFold backend requires fair-esm. Install with:\n"
-                "  pip install fair-esm[esmfold]\n"
+                "  pip install fair-esm\n"
                 "See: https://github.com/facebookresearch/esm"
             )
 
+        # MUST patch the checkpoint on disk BEFORE calling esmfold_v1().
+        # fair-esm's _load_model() raises RuntimeError if expected keys are
+        # missing — there is no way to patch in memory after the fact.
+        _ensure_checkpoint_patched()
+
         logger.info("Loading ESMFold model via fair-esm...")
         self._model = esm.pretrained.esmfold_v1()
-        self._model = self._model.eval()
-
-        # Patch IPA keys in the loaded model's state dict if needed
-        state_dict = self._model.state_dict()
-        needs_patch = any(
-            f"{key}.weight" in state_dict for key in IPA_KEYS_TO_PATCH
-        )
-        if needs_patch:
-            logger.info("Patching ESMFold IPA keys for VizFold compatibility...")
-            patched = _patch_esmfold_state_dict(dict(state_dict))
-            self._model.load_state_dict(patched, strict=False)
-
-        self._model = self._model.to(self.device)
+        self._model = self._model.eval().to(self.device)
         logger.info(f"ESMFold model loaded on {self.device}")
         return self._model
 
