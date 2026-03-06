@@ -3,16 +3,16 @@ ESMFold inference via OpenFold model loading.
 
 Strategy:
   1. Download the ESMFold checkpoint via torch.hub (if not already cached)
-  2. Patch IPA keys ON DISK before loading  ← must happen first
-     fair-esm's _load_model() validates key names during load, so in-memory
-     patching after the fact is too late.
+  2. Patch IPA keys on disk before loading — fair-esm's _load_model() validates
+     key names at load time, so in-memory patching after the fact is too late.
   3. Call esm.pretrained.esmfold_v1() which now finds the patched checkpoint
-  4. Run forward pass with demo_attn=True so ATTENTION_METADATA captures attention
+  4. Enable attention capture via forward hooks (seq_attention) and native
+     ATTENTION_METADATA injection (tri_att_start)
   5. Write structure/, meta.json, logs.txt + attention text files
 
-Note: ESMFold does NOT have triangle attention (no pair representation). Only
-MSA row attention is available. This is an architectural difference from
-OpenFold/AlphaFold2, not a code limitation.
+Attention types captured:
+  - msa_row_attn (sequence self-attention): 48 layers, 32 heads, [L x L]
+  - triangle_start_attn (pair triangle attention): 48 layers, 4 heads, [L x L]
 """
 import logging
 import os
@@ -34,20 +34,16 @@ logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# ESMFold model parameters
 ESMFOLD_LAYER_COUNT = 48  # ESMFold v1 trunk layers
-ESMFOLD_HEAD_COUNT = 8    # heads per attention layer
 
 # IPA keys that need patching for VizFold compatibility.
-# fair-esm downloads a checkpoint with these as `<key>.weight`,
-# but OpenFold v2 (VizFold) renamed them to `<key>.linear.weight`.
+# The checkpoint ships with `<key>.weight` but OpenFold v2 expects `<key>.linear.weight`.
 # See: Meta ESM Issue #435
 IPA_KEYS_TO_PATCH = [
     "trunk.structure_module.ipa.linear_q_points",
     "trunk.structure_module.ipa.linear_kv_points",
 ]
 
-# Cache location where fair-esm stores the downloaded checkpoint
 ESMFOLD_CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/fair-esm/models/esmfold_3B_v1.pt"
 ESMFOLD_CHECKPOINT_NAME = "esmfold_3B_v1.pt"
 
@@ -62,16 +58,12 @@ def _ensure_checkpoint_patched() -> None:
     """
     Download the ESMFold checkpoint if needed, then patch IPA keys on disk.
 
-    This MUST be called before esm.pretrained.esmfold_v1() because fair-esm's
-    _load_model() validates that expected key names are present and raises
-    RuntimeError if they are missing — there is no way to intercept and fix
-    keys after the fact.
-
-    Idempotent: if the checkpoint is already patched, nothing is rewritten.
+    Must be called before esm.pretrained.esmfold_v1() because fair-esm's
+    _load_model() validates key names at load time. Idempotent — no-op if
+    the checkpoint is already patched.
     """
     checkpoint_path = _get_checkpoint_path()
 
-    # Download if not yet cached
     if not os.path.exists(checkpoint_path):
         logger.info(f"Downloading ESMFold checkpoint to {checkpoint_path} ...")
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -81,7 +73,6 @@ def _ensure_checkpoint_patched() -> None:
             progress=True,
         )
 
-    # Load and inspect — patch only if the OLD key format is present
     logger.info("Checking ESMFold checkpoint IPA key format...")
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("model", ckpt)
@@ -101,11 +92,7 @@ def _ensure_checkpoint_patched() -> None:
 
 def _patch_esmfold_state_dict(state_dict: dict) -> dict:
     """
-    Patch ESMFold checkpoint keys for VizFold/OpenFold IPA compatibility.
-
-    ESMFold uses `linear_q_points.weight` while OpenFold v2 (VizFold) expects
-    `linear_q_points.linear.weight`. This patches the keys in-place.
-
+    Rename IPA linear projection keys for VizFold/OpenFold compatibility.
     Returns the patched state dict.
     """
     patched_count = 0
@@ -160,9 +147,9 @@ class ESMFoldRunner:
 
     Uses fair-esm to download the ESMFold checkpoint, patches IPA keys
     for VizFold compatibility, then runs inference. When trace_mode is
-    set to 'attention', leverages the existing ATTENTION_METADATA system
-    in openfold.model.primitives to capture attention maps, which are
-    saved in the standard VizFold text-file format.
+    'attention', captures attention maps from both sequence self-attention
+    (via forward hook) and triangle attention (via ATTENTION_METADATA),
+    saving them in the standard VizFold text-file format.
 
     Usage:
         runner = ESMFoldRunner(device="cuda")
@@ -184,7 +171,7 @@ class ESMFoldRunner:
         self.seed = seed
         self.deterministic = deterministic
         self._model = None
-        self._hook_handles: List[Any] = []  # populated by _enable_attention_capture
+        self._hook_handles: List[Any] = []
 
     def load_model(self) -> Any:
         """Load ESMFold model via fair-esm, returning the model object."""
@@ -204,7 +191,7 @@ class ESMFoldRunner:
             warnings.warn("Deterministic mode may reduce speed.", UserWarning)
 
         try:
-            import esm  # noqa: F401 — checked before patching
+            import esm  # noqa: F401
         except ImportError:
             raise RuntimeError(
                 "ESMFold backend requires fair-esm. Install with:\n"
@@ -212,9 +199,8 @@ class ESMFoldRunner:
                 "See: https://github.com/facebookresearch/esm"
             )
 
-        # MUST patch the checkpoint on disk BEFORE calling esmfold_v1().
-        # fair-esm's _load_model() raises RuntimeError if expected keys are
-        # missing — there is no way to patch in memory after the fact.
+        # Patch checkpoint on disk BEFORE calling esmfold_v1() — fair-esm's
+        # _load_model() validates key names at load time with no interception point.
         _ensure_checkpoint_patched()
 
         logger.info("Loading ESMFold model via fair-esm...")
@@ -244,13 +230,11 @@ class ESMFoldRunner:
             trace_mode: 'attention' or 'none'.
             layers: Which layers to save: 'all' or '0,1,2' or '0:12'.
             top_k: Number of top attention values to save per head.
-            triangle_residue_idx: Residue index for triangle attention.
-                NOTE: ESMFold has no triangle attention — this will be
-                logged as a warning and ignored.
-            attn_map_dir: Directory for attention text files. If None,
-                defaults to out_dir/attention_files.
-            num_recycles_save: Number of recycling iterations to save
-                attention for. If None, saves last recycle only.
+            triangle_residue_idx: Residue index for triangle attention slicing.
+                If None, triangle attention is averaged across all starting residues.
+            attn_map_dir: Directory for attention text files. Defaults to
+                out_dir/attention_files.
+            num_recycles_save: Reserved for future use.
             log_path: Path for log file. Defaults to out_dir/logs.txt.
 
         Returns:
@@ -259,7 +243,6 @@ class ESMFoldRunner:
         os.makedirs(out_dir, exist_ok=True)
         if log_path is None:
             log_path = os.path.join(out_dir, "logs.txt")
-
         if attn_map_dir is None:
             attn_map_dir = os.path.join(out_dir, "attention_files")
 
@@ -268,25 +251,13 @@ class ESMFoldRunner:
                 f.write(msg + "\n")
             logger.info(msg)
 
-        # Handle triangle attention warning
-        if triangle_residue_idx is not None:
-            log(
-                "WARNING: triangle_residue_idx was set but ESMFold does not "
-                "have triangle attention (no pair representation). This "
-                "parameter is ignored. Triangle attention is only available "
-                "with OpenFold/AlphaFold2."
-            )
-
-        # Read FASTA
         seq, seq_id = read_fasta(fasta_path)
         seq_len = len(seq)
         _, fasta_hash = _read_fasta_and_hash(fasta_path)
         log(f"Sequence: {seq_id} ({seq_len} residues)")
 
-        # Load model
         model = self.load_model()
 
-        # Configure attention capture via ATTENTION_METADATA
         want_attn = trace_mode == "attention"
         layer_list = _parse_layers_arg(layers)
 
@@ -298,15 +269,10 @@ class ESMFoldRunner:
                 log(f"Saving layers: {layer_list}")
             else:
                 log("Saving all layers")
-
-            # Enable attention capture in the model
-            # The ESMFold model uses OpenFold's EvoformerStack internally,
-            # which reads attention_config from the model config
             self._enable_attention_capture(model, attn_map_dir, top_k,
                                             triangle_residue_idx,
                                             num_recycles_save)
 
-        # Run inference
         log(f"Running ESMFold inference on {self.device}...")
         t_start = time.perf_counter()
 
@@ -316,26 +282,21 @@ class ESMFoldRunner:
         inference_time = time.perf_counter() - t_start
         log(f"Inference time: {inference_time:.2f}s")
 
-        # Save attention if captured
         if want_attn:
             self._save_captured_attention(attn_map_dir, top_k,
                                            triangle_residue_idx, layer_list, log)
-            # Remove forward hooks to avoid accumulation across runs
             for h in self._hook_handles:
                 h.remove()
             self._hook_handles.clear()
 
-        # Write structure
         struct_paths = write_structure(out_dir, pdb_output)
         log(f"Structure written: {struct_paths}")
 
-        # Determine shapes for metadata
         shapes_recorded = {}
         if want_attn and os.path.exists(attn_map_dir):
             attn_files = [f for f in os.listdir(attn_map_dir) if f.endswith(".txt")]
             shapes_recorded["attention_files"] = attn_files
 
-        # Write metadata
         build_and_write_meta(
             out_dir=out_dir,
             model_name=self.model_name,
@@ -345,7 +306,7 @@ class ESMFoldRunner:
             seq_len=seq_len,
             fasta_hash=fasta_hash,
             layer_count=ESMFOLD_LAYER_COUNT,
-            head_count=ESMFOLD_HEAD_COUNT,
+            head_count=None,
             trace_mode=trace_mode,
             shapes_recorded=shapes_recorded,
             seed=self.seed,
@@ -374,25 +335,22 @@ class ESMFoldRunner:
         Enable attention capture on the ESMFold model's folding trunk.
 
         ESMFold's FoldingTrunk has 48 TriangularSelfAttentionBlock layers.
-        Each block contains two types of attention:
+        Each block has two captured attention types:
 
-        1. seq_attention  (esm.esmfold.v1.misc.Attention -- fair-esm's own class)
-           Returns (output, attn_weights) tuple.
-           Captured via forward hook.
+        1. seq_attention (esm.esmfold.v1.misc.Attention):
+           fair-esm's own class. Returns (output, attn_weights) where
+           attn_weights is [B, L, H, L] (einops rearrangement of [B, H, L, L]).
+           Captured via forward hook; permuted to [B, H, L, L] for storage.
+           Key format: "msa_attention_block_{i}_attn_0" -> msa_row_attn
 
-        2. tri_att_start  (openfold TriangleAttentionStartingNode)
-           Uses VizFold's primitives.Attention internally, which reads
-           self._attention_name and self.attention_config in its forward().
-           Captured by setting those attributes directly.
-
-        All maps are stored in ATTENTION_METADATA.recent_attention using the
-        naming convention that save_all_topk_from_recent_attention() expects:
-          seq:       "msa_attention_block_{i}_attn_0"  -> msa_row_attn
-          tri_start: "tri_attention_block_{i}_attn_0"  -> triangle_start_attn
+        2. tri_att_start (openfold TriangleAttentionStartingNode):
+           Uses VizFold's primitives.Attention internally. Captured by setting
+           _attention_name and attention_config on the inner mha module,
+           which _attention() reads to populate ATTENTION_METADATA.
+           Key format: "tri_attention_block_{i}_attn_0" -> triangle_start_attn
         """
         from openfold.model.primitives import ATTENTION_METADATA
 
-        # Reset capture buffer
         if not hasattr(ATTENTION_METADATA, "recent_attention"):
             ATTENTION_METADATA.recent_attention = {}
         ATTENTION_METADATA.recent_attention.clear()
@@ -409,40 +367,29 @@ class ESMFoldRunner:
             )
             return
 
-        self._hook_handles: List[Any] = []
+        self._hook_handles = []
 
         for block_idx, block in enumerate(model.trunk.blocks):
-            # ----------------------------------------------------------------
-            # 1. SEQUENCE ATTENTION -- fair-esm's Attention class
-            #    forward() returns (output, attn_weights) where attn_weights is
-            #    [B, num_heads, L, L]
-            # ----------------------------------------------------------------
             if hasattr(block, "seq_attention"):
                 layer_name = f"msa_attention_block_{block_idx}_attn_0"
 
                 def make_seq_hook(lname: str):
                     def hook(module, inp, output):
-                        # fair-esm Attention.forward returns (out, weights)
-                        if isinstance(output, (tuple, list)) and len(output) >= 2:
-                            weights = output[1]  # [B, H, L, L]
-                        else:
-                            logger.debug(f"seq_attention at {lname} did not return weights")
+                        if not (isinstance(output, (tuple, list)) and len(output) >= 2):
                             return
+                        weights = output[1]
                         if weights is None:
                             return
-                        # Store as [1, H, L, L] to match msa_row_attn shape convention
-                        arr = weights.detach().cpu().unsqueeze(0).numpy()
+                        # fair-esm returns [B, L, H, L]; permute to [B, H, L, L]
+                        if weights.dim() == 4:
+                            weights = weights.permute(0, 2, 1, 3)
+                        arr = weights.detach().cpu().numpy()
                         ATTENTION_METADATA.recent_attention.setdefault(lname, []).append(arr)
                     return hook
 
                 handle = block.seq_attention.register_forward_hook(make_seq_hook(layer_name))
                 self._hook_handles.append(handle)
 
-            # ----------------------------------------------------------------
-            # 2. TRIANGLE ATTENTION -- OpenFold TriangleAttentionStartingNode
-            #    imported by fair-esm. Uses VizFold's primitives.Attention
-            #    internally, which reads self._attention_name + attention_config.
-            # ----------------------------------------------------------------
             tri_mod = getattr(block, "tri_att_start", None)
             if tri_mod is not None:
                 layer_name = f"tri_attention_block_{block_idx}_attn_0"
@@ -456,7 +403,6 @@ class ESMFoldRunner:
             "(seq_attention hook + tri_att_start native)."
         )
 
-
     def _save_captured_attention(
         self,
         attn_map_dir: str,
@@ -466,13 +412,20 @@ class ESMFoldRunner:
         log,
     ) -> None:
         """
-        Save attention maps captured by ATTENTION_METADATA to text files.
+        Normalize captured attention shapes and save to text files.
 
-        Uses the existing save_all_topk_from_recent_attention() from
-        evoformer.py, which writes the standard VizFold text format.
+        Both attention types accumulate one array per recycle. We take only the
+        last recycle (most refined) and normalize shapes:
+
+          msa_row_attn:       hook stores [B, H, L, L]  → (M, N, S, S) ✓
+          triangle_start_attn: _attention() stores [B, L, H, L, L] (5D, pair dims);
+                               squeeze B → [L, H, L, L] = (Q, R, S, S) ✓
         """
         from openfold.model.primitives import ATTENTION_METADATA
-        from openfold.model.evoformer import save_all_topk_from_recent_attention
+        from openfold.model.evoformer import (
+            save_all_topk_from_recent_attention,
+            parse_attention_metadata_key,
+        )
 
         if not hasattr(ATTENTION_METADATA, "recent_attention"):
             log("WARNING: No attention data captured. ATTENTION_METADATA.recent_attention not found.")
@@ -480,27 +433,48 @@ class ESMFoldRunner:
 
         if not ATTENTION_METADATA.recent_attention:
             log("WARNING: No attention data captured. recent_attention is empty.")
-            log("This may happen if the ESMFold model's internal architecture "
-                "does not use the standard OpenFold attention path.")
-            log("Consider using run_pretrained_openfold.py with an ESMFold "
-                "checkpoint for full attention capture.")
             return
 
         captured_keys = list(ATTENTION_METADATA.recent_attention.keys())
         log(f"Captured attention for {len(captured_keys)} layer(s): {captured_keys[:5]}...")
 
-        # Filter by layer list if specified
-        if layer_list is not None:
-            from openfold.model.evoformer import parse_attention_metadata_key
-            filtered = {}
-            for k, v in ATTENTION_METADATA.recent_attention.items():
-                _, layer_idx = parse_attention_metadata_key(k)
-                if layer_idx in layer_list:
-                    filtered[k] = v
-            ATTENTION_METADATA.recent_attention = filtered
-            log(f"Filtered to {len(filtered)} layers: {layer_list}")
+        normalized: dict = {}
+        for k, v_list in ATTENTION_METADATA.recent_attention.items():
+            if not v_list:
+                continue
 
-        # Save using existing VizFold pipeline
+            attn_type, layer_idx = parse_attention_metadata_key(k)
+            if attn_type is None or layer_idx < 0:
+                continue
+
+            if layer_list is not None and layer_idx not in layer_list:
+                continue
+
+            arr = v_list[-1]  # last recycle only
+
+            if attn_type == "msa_row_attn":
+                if arr.ndim == 4:
+                    normalized[k] = arr
+                else:
+                    log(f"WARNING: unexpected msa_row_attn shape {arr.shape} for {k}, skipping")
+
+            elif attn_type == "triangle_start_attn":
+                if arr.ndim == 5:
+                    normalized[k] = arr[0]  # squeeze batch dim
+                elif arr.ndim == 4:
+                    normalized[k] = arr
+                else:
+                    log(f"WARNING: unexpected triangle_start_attn shape {arr.shape} for {k}, skipping")
+
+        if not normalized:
+            log("WARNING: No valid attention data after normalization.")
+            ATTENTION_METADATA.recent_attention.clear()
+            return
+
+        log(f"Normalized {len(normalized)} attention entries.")
+
+        ATTENTION_METADATA.recent_attention = {k: [v] for k, v in normalized.items()}
+
         save_all_topk_from_recent_attention(
             save_dir=attn_map_dir,
             triangle_residue_idx=triangle_residue_idx,
@@ -508,5 +482,4 @@ class ESMFoldRunner:
         )
         log(f"Attention maps saved to {attn_map_dir}")
 
-        # Clean up
         ATTENTION_METADATA.recent_attention.clear()
