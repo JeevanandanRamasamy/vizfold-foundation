@@ -18,3 +18,4 @@ cutlass/
 *.sto
 *.a3m
 *.hhr
+.DS_Store
