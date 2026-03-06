@@ -184,6 +184,7 @@ class ESMFoldRunner:
         self.seed = seed
         self.deterministic = deterministic
         self._model = None
+        self._hook_handles: List[Any] = []  # populated by _enable_attention_capture
 
     def load_model(self) -> Any:
         """Load ESMFold model via fair-esm, returning the model object."""
@@ -319,6 +320,10 @@ class ESMFoldRunner:
         if want_attn:
             self._save_captured_attention(attn_map_dir, top_k,
                                            triangle_residue_idx, layer_list, log)
+            # Remove forward hooks to avoid accumulation across runs
+            for h in self._hook_handles:
+                h.remove()
+            self._hook_handles.clear()
 
         # Write structure
         struct_paths = write_structure(out_dir, pdb_output)
@@ -366,44 +371,91 @@ class ESMFoldRunner:
         num_recycles_save: Optional[int],
     ) -> None:
         """
-        Enable the ATTENTION_METADATA capture system on the ESMFold model.
+        Enable attention capture on the ESMFold model's folding trunk.
 
-        This works by setting the attention_config on the model's internal
-        EvoformerStack and its attention layers, which causes _attention()
-        in primitives.py to save attention maps.
+        ESMFold's FoldingTrunk has 48 TriangularSelfAttentionBlock layers.
+        Each block contains two types of attention:
+
+        1. seq_attention  (esm.esmfold.v1.misc.Attention -- fair-esm's own class)
+           Returns (output, attn_weights) tuple.
+           Captured via forward hook.
+
+        2. tri_att_start  (openfold TriangleAttentionStartingNode)
+           Uses VizFold's primitives.Attention internally, which reads
+           self._attention_name and self.attention_config in its forward().
+           Captured by setting those attributes directly.
+
+        All maps are stored in ATTENTION_METADATA.recent_attention using the
+        naming convention that save_all_topk_from_recent_attention() expects:
+          seq:       "msa_attention_block_{i}_attn_0"  -> msa_row_attn
+          tri_start: "tri_attention_block_{i}_attn_0"  -> triangle_start_attn
         """
         from openfold.model.primitives import ATTENTION_METADATA
 
-        # Initialize ATTENTION_METADATA
+        # Reset capture buffer
         if not hasattr(ATTENTION_METADATA, "recent_attention"):
             ATTENTION_METADATA.recent_attention = {}
         ATTENTION_METADATA.recent_attention.clear()
 
-        # Walk the model to find attention modules and set their config
         attention_config = {
             "demo_attn": True,
             "triangle_residue_idx": triangle_residue_idx,
         }
 
-        # ESMFold's internal structure: model.trunk.evoformer (EvoformerStack)
-        # We need to find and configure all attention layers
-        for name, module in model.named_modules():
-            # Set attention config on any module that accepts it
-            if hasattr(module, "attention_config"):
-                module.attention_config = attention_config
-            # Also check for _attention_name (set by assign_layer_names)
-            if hasattr(module, "mha") and hasattr(module.mha, "_attention_name"):
-                pass  # Already configured by assign_layer_names
+        if not (hasattr(model, "trunk") and hasattr(model.trunk, "blocks")):
+            logger.warning(
+                "ESMFold model does not have expected trunk.blocks structure. "
+                "Attention capture may not work."
+            )
+            return
 
-        # Try to call assign_layer_names if the model has EvoformerStack
-        for name, module in model.named_modules():
-            if hasattr(module, "assign_layer_names") and callable(module.assign_layer_names):
-                module.assign_layer_names()
-                logger.info(f"Assigned layer names on {name}")
+        self._hook_handles: List[Any] = []
 
-        # Store config for later use
-        if hasattr(model, "trunk") and hasattr(model.trunk, "evoformer"):
-            model.trunk.evoformer.attn_map_dir = attn_map_dir
+        for block_idx, block in enumerate(model.trunk.blocks):
+            # ----------------------------------------------------------------
+            # 1. SEQUENCE ATTENTION -- fair-esm's Attention class
+            #    forward() returns (output, attn_weights) where attn_weights is
+            #    [B, num_heads, L, L]
+            # ----------------------------------------------------------------
+            if hasattr(block, "seq_attention"):
+                layer_name = f"msa_attention_block_{block_idx}_attn_0"
+
+                def make_seq_hook(lname: str):
+                    def hook(module, inp, output):
+                        # fair-esm Attention.forward returns (out, weights)
+                        if isinstance(output, (tuple, list)) and len(output) >= 2:
+                            weights = output[1]  # [B, H, L, L]
+                        else:
+                            logger.debug(f"seq_attention at {lname} did not return weights")
+                            return
+                        if weights is None:
+                            return
+                        # Store as [1, H, L, L] to match msa_row_attn shape convention
+                        arr = weights.detach().cpu().unsqueeze(0).numpy()
+                        ATTENTION_METADATA.recent_attention.setdefault(lname, []).append(arr)
+                    return hook
+
+                handle = block.seq_attention.register_forward_hook(make_seq_hook(layer_name))
+                self._hook_handles.append(handle)
+
+            # ----------------------------------------------------------------
+            # 2. TRIANGLE ATTENTION -- OpenFold TriangleAttentionStartingNode
+            #    imported by fair-esm. Uses VizFold's primitives.Attention
+            #    internally, which reads self._attention_name + attention_config.
+            # ----------------------------------------------------------------
+            tri_mod = getattr(block, "tri_att_start", None)
+            if tri_mod is not None:
+                layer_name = f"tri_attention_block_{block_idx}_attn_0"
+                mha = getattr(tri_mod, "mha", None)
+                if mha is not None and hasattr(mha, "attention_config"):
+                    mha.attention_config = attention_config
+                    mha._attention_name = layer_name
+
+        logger.info(
+            f"Registered attention capture on {len(model.trunk.blocks)} trunk blocks "
+            "(seq_attention hook + tri_att_start native)."
+        )
+
 
     def _save_captured_attention(
         self,
