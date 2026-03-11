@@ -38,8 +38,16 @@ def _get_pdb_utils():
         return None, None, None
 
 
-LONG_SEQ_WARN_THRESHOLD = 400  # N^2 attention warning
+LONG_SEQ_WARN_THRESHOLD = 400
 HF_MODEL_DEFAULT = "facebook/esmfold_v1"
+
+AA_1TO3 = {
+    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
+    "E": "GLU", "Q": "GLN", "G": "GLY", "H": "HIS", "I": "ILE",
+    "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO",
+    "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL",
+    "U": "SEC", "O": "PYL", "X": "UNK",
+}
 
 
 def _parse_layers_arg(layers_arg: Optional[str]) -> Optional[List[int]]:
@@ -62,14 +70,16 @@ def _parse_heads_arg(heads_arg: Optional[str]) -> Optional[List[int]]:
     return [int(x.strip()) for x in heads_arg.split(",")]
 
 
-def read_fasta(fasta_path: str) -> Tuple[str, str]:
-    """Return (sequence, id)."""
-    seq, _ = _read_fasta_and_hash(fasta_path)
+def read_fasta(fasta_path: str) -> Tuple[str, str, str]:
+    """Return (sequence, seq_id, fasta_hash)."""
+    seq, fasta_hash = _read_fasta_and_hash(fasta_path)
+    seq_id = "seq"
     with open(fasta_path) as f:
         for line in f:
             if line.startswith(">"):
-                return seq, line[1:].strip().split()[0]
-    return seq, "seq"
+                seq_id = line[1:].strip().split()[0]
+                break
+    return seq, seq_id, fasta_hash
 
 
 class ESMFoldRunner:
@@ -83,7 +93,7 @@ class ESMFoldRunner:
         self,
         model_name: str = HF_MODEL_DEFAULT,
         device: str = "cpu",
-        dtype: Optional[str] = None,
+        dtype: str = "float32",
         seed: Optional[int] = None,
         deterministic: bool = False,
     ):
@@ -93,7 +103,7 @@ class ESMFoldRunner:
             )
         self.model_name = model_name
         self.device = device
-        self.dtype = dtype or "float32"
+        self.dtype = dtype
         self.seed = seed
         self.deterministic = deterministic
         self._model = None
@@ -145,9 +155,8 @@ class ESMFoldRunner:
                 f.write(msg + "\n")
             print(msg)
 
-        seq, seq_id = read_fasta(fasta_path)
+        seq, seq_id, fasta_hash = read_fasta(fasta_path)
         seq_len = len(seq)
-        _, fasta_hash = _read_fasta_and_hash(fasta_path)
 
         if seq_len > LONG_SEQ_WARN_THRESHOLD and "attention" in trace_mode:
             log(
@@ -169,7 +178,7 @@ class ESMFoldRunner:
             head_indices=head_list,
         )
 
-        # Tokenize: single sequence, no special tokens (per HF ESMFold usage)
+        # Tokenize (HF ESMFold: add_special_tokens=False per standard usage)
         inputs = tokenizer(
             [seq],
             return_tensors="pt",
@@ -181,90 +190,23 @@ class ESMFoldRunner:
         if attention_mask is not None:
             attention_mask = attention_mask.to(device=self.device)
 
-        # HF EsmForProteinFolding does NOT accept output_attentions / output_hidden_states.
-        # For traces we use hooks on model.esm; for structure-only we just run forward.
+        # HF EsmForProteinFolding does NOT accept output_attentions/output_hidden_states.
+        # Hooks on model.esm capture traces during the single forward pass.
         if trace_mode != "none":
             esm_trunk = getattr(model, "esm", model)
             collector.register_hooks(esm_trunk)
 
         with torch.no_grad():
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
 
         if trace_mode != "none":
             collector.remove_hooks()
 
-        # Structure: PDB + optional coords tensor (HF returns dict-like or object)
-        pdb_str = None
-        coords = None
-        atom14_to_atom37, OFProtein, to_pdb = _get_pdb_utils()
+        log(f"Forward pass complete. Captured {len(collector.attention)} attention layers, "
+            f"{len(collector.activations)} activation layers.")
 
-        def _get_out(key: str):
-            if hasattr(out, key):
-                return getattr(out, key)
-            if isinstance(out, dict) and key in out:
-                return out[key]
-            return None
-
-        positions = _get_out("positions")
-        if positions is not None:
-            try:
-                if atom14_to_atom37 and OFProtein is not None and to_pdb is not None:
-                    # positions: often [num_recycling, batch, N, 14, 3]; use last recycling
-                    pos = positions
-                    if pos.dim() == 5:
-                        pos = pos[-1]
-                    final_atom37 = atom14_to_atom37(pos, out)
-                    coords = final_atom37
-                    out_cpu = {}
-                    for k in ("aatype", "atom37_atom_exists", "residue_index", "plddt", "chain_index"):
-                        v = _get_out(k)
-                        if v is not None:
-                            out_cpu[k] = v.cpu().numpy() if isinstance(v, torch.Tensor) else v
-                    pos_np = final_atom37.cpu().numpy()
-                    for i in range(pos_np.shape[0]):
-                        pred = OFProtein(
-                            aatype=out_cpu["aatype"][i],
-                            atom_positions=pos_np[i],
-                            atom_mask=out_cpu["atom37_atom_exists"][i],
-                            residue_index=out_cpu["residue_index"][i] + 1,
-                            b_factors=out_cpu["plddt"][i],
-                            chain_index=out_cpu.get("chain_index", [None] * pos_np.shape[0])[i] if "chain_index" in out_cpu else None,
-                        )
-                        pdb_str = to_pdb(pred)
-                        break
-                else:
-                    pos = positions
-                    if pos.dim() == 5:
-                        pos = pos[-1, 0]
-                    elif pos.dim() == 4:
-                        pos = pos[0]
-                    coords = pos
-                    if coords.dim() == 4:
-                        ca_idx = 1
-                        coords = coords[:, :, ca_idx, :]
-                    pdb_str = _coords_to_minimal_pdb(coords[0], seq)
-            except Exception as e:
-                log(f"Warning: PDB conversion failed ({e}); writing minimal PDB if possible.")
-                if coords is not None:
-                    try:
-                        c = coords[0] if coords.dim() > 2 else coords
-                        if c.dim() == 3:
-                            c = c[:, 1, :]
-                        pdb_str = _coords_to_minimal_pdb(c, seq)
-                    except Exception:
-                        pass
-
-        if pdb_str is None and coords is not None:
-            c = coords[0] if coords.dim() > 2 else coords
-            if c.dim() == 3:
-                c = c[:, 1, :]
-            pdb_str = _coords_to_minimal_pdb(c, seq)
-        if pdb_str is None:
-            log("Warning: no PDB output from model; structure/ may be incomplete.")
-
+        # Structure: PDB + optional coords tensor
+        pdb_str, coords = self._extract_structure(out, seq, log)
         struct_paths = write_structure(out_dir, pdb_str, coords)
         log(f"Structure written: {struct_paths}")
 
@@ -287,16 +229,14 @@ class ESMFoldRunner:
             except Exception:
                 pass
 
-        layer_count = max(
-            len(collector.attention),
-            len(collector.activations),
-            1,
-        )
+        layer_count = max(len(collector.attention), len(collector.activations), 1)
         head_count = 0
         if collector.attention:
             first_attn = next(iter(collector.attention.values()))
-            if first_attn.dim() >= 3:
-                head_count = first_attn.shape[-3] if first_attn.dim() == 3 else first_attn.shape[1]
+            if first_attn.dim() == 4:
+                head_count = first_attn.shape[1]
+            elif first_attn.dim() == 3:
+                head_count = first_attn.shape[0]
 
         build_and_write_meta(
             out_dir=out_dir,
@@ -320,20 +260,91 @@ class ESMFoldRunner:
             "structure": struct_paths,
             "out_dir": out_dir,
             "trace_mode": trace_mode,
+            "attention_layers": len(collector.attention),
+            "activation_layers": len(collector.activations),
         }
+
+    def _extract_structure(self, out: Any, seq: str, log) -> Tuple[Optional[str], Optional[torch.Tensor]]:
+        """Extract PDB string and coordinates from model output."""
+        pdb_str = None
+        coords = None
+        atom14_to_atom37, OFProtein, to_pdb = _get_pdb_utils()
+
+        def _get(key: str):
+            if hasattr(out, key):
+                return getattr(out, key)
+            if isinstance(out, dict) and key in out:
+                return out[key]
+            return None
+
+        positions = _get("positions")
+        if positions is None:
+            log("Warning: no positions in model output; structure/ may be incomplete.")
+            return pdb_str, coords
+
+        try:
+            if atom14_to_atom37 and OFProtein is not None and to_pdb is not None:
+                pos = positions[-1] if positions.dim() == 5 else positions
+                final_atom37 = atom14_to_atom37(pos, out)
+                coords = final_atom37
+                out_cpu = {}
+                for k in ("aatype", "atom37_atom_exists", "residue_index", "plddt", "chain_index"):
+                    v = _get(k)
+                    if v is not None:
+                        out_cpu[k] = v.cpu().numpy() if isinstance(v, torch.Tensor) else v
+                pos_np = final_atom37.cpu().numpy()
+                pred = OFProtein(
+                    aatype=out_cpu["aatype"][0],
+                    atom_positions=pos_np[0],
+                    atom_mask=out_cpu["atom37_atom_exists"][0],
+                    residue_index=out_cpu["residue_index"][0] + 1,
+                    b_factors=out_cpu["plddt"][0],
+                    chain_index=out_cpu.get("chain_index", [None])[0] if "chain_index" in out_cpu else None,
+                )
+                pdb_str = to_pdb(pred)
+            else:
+                pos = positions
+                if pos.dim() == 5:
+                    pos = pos[-1, 0]
+                elif pos.dim() == 4:
+                    pos = pos[0]
+                coords = pos
+                pdb_str = _coords_to_minimal_pdb(coords, seq)
+        except Exception as e:
+            log(f"Warning: PDB conversion failed ({e}); writing minimal PDB.")
+            try:
+                if positions is not None:
+                    pos = positions
+                    if pos.dim() == 5:
+                        pos = pos[-1, 0]
+                    elif pos.dim() == 4:
+                        pos = pos[0]
+                    pdb_str = _coords_to_minimal_pdb(pos, seq)
+                    coords = pos
+            except Exception:
+                pass
+
+        if pdb_str is None and coords is not None:
+            pdb_str = _coords_to_minimal_pdb(coords, seq)
+        if pdb_str is None:
+            log("Warning: no PDB output from model; structure/ may be incomplete.")
+
+        return pdb_str, coords
 
 
 def _coords_to_minimal_pdb(coords: torch.Tensor, seq: str) -> str:
-    """Write minimal CA-only PDB from coords [N, 3] or [N, 37, 3]."""
+    """Write minimal CA-only PDB from coords [N, 14, 3] or [N, 37, 3] or [N, 3]."""
     if coords.dim() == 3:
-        ca = coords[:, 1, :]  # assume atom37 order: N, CA, C, ...
+        ca = coords[:, 1, :]  # atom37/atom14 order: N=0, CA=1, C=2, ...
     else:
         ca = coords
     lines = []
-    for i in range(ca.shape[0]):
-        a = ca[i].cpu().numpy()
-        res = seq[i] if i < len(seq) else "X"
+    for i in range(min(ca.shape[0], len(seq))):
+        a = ca[i].float().cpu().numpy()
+        res3 = AA_1TO3.get(seq[i], "UNK")
         lines.append(
-            f"ATOM  {i+1:5d}  CA  {res} A{i+1:4d}    {a[0]:8.3f}{a[1]:8.3f}{a[2]:8.3f}  1.00  0.00           C"
+            f"ATOM  {i+1:5d}  CA  {res3:>3s} A{i+1:4d}    "
+            f"{a[0]:8.3f}{a[1]:8.3f}{a[2]:8.3f}  1.00  0.00           C"
         )
+    lines.append("END")
     return "\n".join(lines) + "\n"

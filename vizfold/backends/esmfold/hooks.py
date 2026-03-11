@@ -1,10 +1,18 @@
 """
-Hook-based extraction of attention and hidden states from ESMFold.
+Hook-based extraction of attention weights and hidden states from HuggingFace ESMFold.
 
-Strategy:
-  1. Prefer model outputs (output_attentions=True, output_hidden_states=True) if available.
-  2. Fall back to forward hooks on known modules with a clear warning.
+HF EsmForProteinFolding does NOT support output_attentions / output_hidden_states.
+We capture traces by registering forward hooks on the ESM-2 trunk:
+
+  Attention weights: hook on each EsmSelfAttention module, monkey-patching
+                     the forward to force attn_weights to be returned.
+  Activations:       hook on each EsmLayer (full transformer block output).
+
+The ESM-2 tokenizer adds <cls> and <eos> tokens, so attention maps are
+(seq_len+2, seq_len+2). We slice out the special tokens so stored tensors
+are (seq_len, seq_len), matching the FASTA sequence.
 """
+import re
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -14,9 +22,8 @@ import torch.nn as nn
 
 class ESMFoldTraceCollector:
     """
-    Collects attention weights and/or hidden states during ESMFold forward.
-
-    Can use either returned outputs (preferred) or registered hooks.
+    Collects attention weights and/or hidden states from the ESM-2 trunk
+    inside HuggingFace EsmForProteinFolding.
     """
 
     def __init__(
@@ -33,102 +40,122 @@ class ESMFoldTraceCollector:
         self.attention: Dict[str, torch.Tensor] = {}
         self.activations: Dict[str, torch.Tensor] = {}
         self._handles: List[Any] = []
+        self._patched_forwards: List[Tuple[nn.Module, Callable]] = []
 
     def clear(self) -> None:
         self.attention.clear()
         self.activations.clear()
 
-    def _store_attention(self, name: str, attn: torch.Tensor, layer_idx: int) -> None:
-        if self.layer_indices is not None and layer_idx not in self.layer_indices:
-            return
-        key = f"layer_{layer_idx:03d}"
-        if key not in self.attention:
-            self.attention[key] = attn.detach()
-        else:
-            self.attention[key] = torch.stack([self.attention[key], attn.detach()], dim=0)
+    def _should_store_layer(self, layer_idx: int) -> bool:
+        return self.layer_indices is None or layer_idx in self.layer_indices
 
-    def _store_activation(self, name: str, h: torch.Tensor, layer_idx: int) -> None:
-        if self.layer_indices is not None and layer_idx not in self.layer_indices:
-            return
-        key = f"layer_{layer_idx:03d}"
-        self.activations[key] = h.detach()
-
-    def try_use_outputs(
-        self,
-        outputs: Any,
-        model_name: str = "esmfold",
-    ) -> Tuple[bool, bool]:
+    def register_hooks(self, esm_model: nn.Module) -> None:
         """
-        Try to populate from model forward return value.
-        Returns (got_attention, got_activations).
+        Register hooks on the ESM-2 trunk (model.esm passed in).
+
+        Targets:
+          - encoder.layer[i].attention.self  -> attention weights [B, H, N, N]
+          - encoder.layer[i]                 -> activations [B, N, D]
+
+        For HF ESM, EsmSelfAttention.forward() only returns attn_weights when
+        the framework's output capturing mechanism requests it. We monkey-patch
+        the forward to always emit (output, attn_weights).
         """
-        got_attn, got_act = False, False
-        if hasattr(outputs, "attentions") and outputs.attentions is not None and self.want_attention:
-            for i, attn in enumerate(outputs.attentions):
-                if attn is not None:
-                    self._store_attention("output", attn, i)
-                    got_attn = True
-        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None and self.want_activations:
-            for i, h in enumerate(outputs.hidden_states):
-                if h is not None:
-                    self._store_activation("output", h, i)
-                    got_act = True
-        if self.want_attention and not got_attn and hasattr(outputs, "states"):
-            # ESMFold may return trunk states; no standard attentions
-            pass
-        return got_attn, got_act
-
-    def register_hooks(self, model: nn.Module) -> None:
-        """
-        Register forward hooks to capture attention/activations if not from outputs.
-        ESMFold structure: esm trunk -> folding trunk. We hook transformer layers.
-        """
-        layer_idx = [0]
-
-        def _make_attn_hook(idx: int) -> Callable:
-            def hook(module: nn.Module, inp: Any, out: Any) -> None:
-                if isinstance(out, tuple):
-                    # Many attention modules return (output, attn_weights)
-                    for o in out:
-                        if o is not None and o.dim() >= 3 and o.shape[0] == out[0].shape[0]:
-                            self._store_attention("hook", o, idx)
-                            break
-                elif out is not None and out.dim() >= 3:
-                    self._store_attention("hook", out, idx)
-            return hook
-
-        def _make_act_hook(idx: int) -> Callable:
-            def hook(module: nn.Module, inp: Any, out: Any) -> None:
-                if isinstance(out, tuple):
-                    out = out[0]
-                if out is not None and out.dim() >= 2:
-                    self._store_activation("hook", out, idx)
-            return hook
-
-        for name, module in model.named_modules():
-            if "attention" in name.lower() and hasattr(module, "forward"):
-                try:
-                    h = module.register_forward_hook(_make_attn_hook(layer_idx[0]))
-                    self._handles.append(h)
-                    layer_idx[0] += 1
-                except Exception:
-                    pass
-            if "layer" in name.lower() and "encoder" in name.lower() and hasattr(module, "forward"):
-                try:
-                    h = module.register_forward_hook(_make_act_hook(layer_idx[0]))
-                    self._handles.append(h)
-                    layer_idx[0] += 1
-                except Exception:
-                    pass
-
-        if self._handles:
+        encoder_layers = self._find_encoder_layers(esm_model)
+        if not encoder_layers:
             warnings.warn(
-                "ESMFold: using forward hooks for trace extraction; "
-                "output_attentions/output_hidden_states were not available.",
+                "Could not find encoder.layer ModuleList in ESM trunk. "
+                "Trace extraction may not work.",
                 UserWarning,
             )
+            return
+
+        for layer_idx, layer_module in enumerate(encoder_layers):
+            if not self._should_store_layer(layer_idx):
+                continue
+
+            if self.want_attention:
+                self_attn = self._find_self_attention(layer_module)
+                if self_attn is not None:
+                    self._patch_and_hook_attention(self_attn, layer_idx)
+
+            if self.want_activations:
+                h = layer_module.register_forward_hook(self._make_activation_hook(layer_idx))
+                self._handles.append(h)
 
     def remove_hooks(self) -> None:
         for h in self._handles:
             h.remove()
         self._handles.clear()
+        for module, orig_forward in self._patched_forwards:
+            module.forward = orig_forward
+        self._patched_forwards.clear()
+
+    def _find_encoder_layers(self, esm_model: nn.Module) -> Optional[nn.ModuleList]:
+        """Find the nn.ModuleList of transformer layers in the ESM encoder."""
+        if hasattr(esm_model, "encoder"):
+            enc = esm_model.encoder
+            if hasattr(enc, "layer") and isinstance(enc.layer, nn.ModuleList):
+                return enc.layer
+        for name, module in esm_model.named_modules():
+            if isinstance(module, nn.ModuleList) and re.match(r".*encoder.*layer$", name):
+                return module
+        return None
+
+    def _find_self_attention(self, layer_module: nn.Module) -> Optional[nn.Module]:
+        """Find the self-attention submodule inside a transformer layer."""
+        if hasattr(layer_module, "attention"):
+            attn = layer_module.attention
+            if hasattr(attn, "self"):
+                return attn.self
+            return attn
+        return None
+
+    def _patch_and_hook_attention(self, self_attn: nn.Module, layer_idx: int) -> None:
+        """
+        Monkey-patch EsmSelfAttention.forward to always return attn_weights,
+        then register a hook to capture them.
+
+        HF EsmSelfAttention returns (attn_output, attn_weights) from its
+        internal attention function. But the outer EsmAttention layer discards
+        attn_weights with `attn_output, _ = self.self(...)`. We hook self_attn
+        directly to get the full tuple.
+        """
+        orig_forward = self_attn.forward
+
+        def patched_forward(*args, **kwargs):
+            # Force output_attentions so the attention weights are computed
+            # and included in the return tuple.
+            kwargs["output_attentions"] = True
+            return orig_forward(*args, **kwargs)
+
+        self_attn.forward = patched_forward
+        self._patched_forwards.append((self_attn, orig_forward))
+
+        h = self_attn.register_forward_hook(self._make_attention_hook(layer_idx))
+        self._handles.append(h)
+
+    def _make_attention_hook(self, layer_idx: int) -> Callable:
+        """Hook that captures attn_weights from (attn_output, attn_weights) tuple."""
+        def hook(module: nn.Module, inp: Any, out: Any) -> None:
+            if not isinstance(out, tuple) or len(out) < 2:
+                return
+            attn_weights = out[1]
+            if attn_weights is None:
+                return
+            # attn_weights shape: [B, H, N+2, N+2] (includes <cls> and <eos>)
+            # Slice out special tokens -> [B, H, N, N]
+            if attn_weights.dim() == 4 and attn_weights.shape[-1] >= 3:
+                attn_weights = attn_weights[:, :, 1:-1, 1:-1]
+            key = f"layer_{layer_idx:03d}"
+            self.attention[key] = attn_weights.detach()
+        return hook
+
+    def _make_activation_hook(self, layer_idx: int) -> Callable:
+        """Hook that captures the transformer layer output (hidden state)."""
+        def hook(module: nn.Module, inp: Any, out: Any) -> None:
+            h = out[0] if isinstance(out, tuple) else out
+            if h is not None and isinstance(h, torch.Tensor) and h.dim() >= 2:
+                key = f"layer_{layer_idx:03d}"
+                self.activations[key] = h.detach()
+        return hook

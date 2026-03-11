@@ -76,7 +76,9 @@ def write_traces(
     for key, t in collector.attention.items():
         path = os.path.join(attn_dir, f"{key}.pt")
         if head_indices is not None and t.dim() >= 3:
-            t = t[:, head_indices, ...]
+            # Attention shape: [B, H, N, N] (4D) or [H, N, N] (3D)
+            head_dim = 1 if t.dim() == 4 else 0
+            t = t.index_select(head_dim, torch.tensor(head_indices, device=t.device))
         _save_tensor(path, t, save_fp16=save_fp16)
         attention_index[key] = {
             "path": path,
@@ -120,8 +122,9 @@ def write_trace_summary(
             layer_key = f"{key}_slice{i}" if a.shape[0] > 1 else key
             block = a[i]
             if block.ndim >= 3:
-                # heads, N, N
-                ent = -np.sum(block * np.log(block + 1e-12), axis=(-2, -1)).mean()
+                # block: [heads, N, N] — each row is a distribution over keys
+                # Entropy per row (axis=-1), averaged over all rows and heads
+                ent = -np.sum(block * np.log(block + 1e-12), axis=-1).mean()
                 summary["attention"][layer_key] = {
                     "mean": float(block.mean()),
                     "std": float(block.std()),

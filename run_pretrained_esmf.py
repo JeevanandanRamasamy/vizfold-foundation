@@ -16,6 +16,7 @@ Example:
     --save_fp16
 """
 import argparse
+import json
 import os
 import sys
 
@@ -48,6 +49,13 @@ def main() -> int:
         type=str,
         default=None,
         help="Device: cuda, cuda:0, cpu. Default: cuda if available else cpu.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16"],
+        help="Model dtype (float16 reduces VRAM but may lower accuracy).",
     )
     parser.add_argument(
         "--trace_mode",
@@ -106,10 +114,11 @@ def main() -> int:
     runner = ESMFoldRunner(
         model_name=args.model,
         device=args.device,
+        dtype=args.dtype,
         seed=args.seed,
         deterministic=args.deterministic,
     )
-    runner.run(
+    result = runner.run(
         fasta_path=args.fasta,
         out_dir=args.out,
         trace_mode=args.trace_mode,
@@ -118,6 +127,8 @@ def main() -> int:
         save_fp16=args.save_fp16,
     )
     print(f"Done. Outputs in {args.out}")
+    print(f"  attention layers: {result.get('attention_layers', 0)}, "
+          f"activation layers: {result.get('activation_layers', 0)}")
     return 0
 
 
