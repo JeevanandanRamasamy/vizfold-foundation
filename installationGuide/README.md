@@ -16,7 +16,7 @@ This document provides instructions for setting up OpenFold and the Attention Vi
 2. Click on the button labeled kernel (Top right)
 3. Select "Python Kernel", then the kernel starting with "base". If it doesn't appear, click the refresh button. 
 4. For the third line of the first cell (`os.environ['_DIR'] = '~/scratch'`), change the directory to where you want to store your Openfold and Attention Visualization Demo. 
-5. For the ninth line of the first cell (`os.environ['CONDA_MODULE'] = 'miniforge'`), change the module which loads Conda and Mamba on your HPC (use `module spyder` and search for modules which set up a mini Conda/Mamba environment - change `os.environ['MAMBA_CMD']` if your module doesn't provide Mamba)
+5. For the ninth line of the first cell (`os.environ['CONDA_MODULE'] = 'miniforge'`), change the module which loads Conda and Mamba on your HPC (use `module spider` and search for modules which set up a mini Conda/Mamba environment - change `os.environ['MAMBA_CMD']` if your module doesn't provide Mamba)
 6. Click "Run All" to execute the installation process. This will switch to a conda environment, install all dependences, and install OpenFold and the Attention Visualization Demo in your environment.
 
 ## Notes
