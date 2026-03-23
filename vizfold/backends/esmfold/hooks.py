@@ -17,6 +17,7 @@ import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
+import inspect
 import torch.nn as nn
 
 
@@ -122,15 +123,13 @@ class ESMFoldTraceCollector:
         directly to get the full tuple.
         """
         orig_forward = self_attn.forward
+        params = list(inspect.signature(orig_forward).parameters)
+        # Find output_attentions position by name — robust to signature changes
+        oa_pos = params.index("output_attentions") if "output_attentions" in params else -1
 
         def patched_forward(*args, **kwargs):
-            # EsmAttention passes output_attentions as the 7th positional arg
-            # (index 6) to EsmSelfAttention.forward(). Adding it to kwargs too
-            # causes "multiple values for argument" TypeError, so override
-            # positionally when present, otherwise inject via kwargs.
-            OA_POS = 6
-            if len(args) > OA_POS:
-                args = args[:OA_POS] + (True,) + args[OA_POS + 1:]
+            if oa_pos >= 0 and oa_pos < len(args):
+                args = args[:oa_pos] + (True,) + args[oa_pos + 1:]
             else:
                 kwargs["output_attentions"] = True
             return orig_forward(*args, **kwargs)

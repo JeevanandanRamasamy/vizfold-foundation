@@ -15,9 +15,13 @@ Layout:
         layer_000.pt
         ...
       index.json
+    attention_files/
+      msa_row_attn_layer0.txt   (VizFold text format)
+      ...
     logs.txt (caller appends)
 """
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -111,6 +115,9 @@ def write_attention_txt(
     msa_row_attn_layer*.txt format used by VizFold visualization tools
     (PyMOL scripts, arc diagrams, etc.).
 
+    Does not require OpenFold to be installed — uses a self-contained
+    implementation of the top-k writing logic with numpy only.
+
     Args:
         out_dir: Root output directory. Files go to out_dir/attention_files/.
         collector: ESMFoldTraceCollector with populated .attention dict.
@@ -120,7 +127,6 @@ def write_attention_txt(
         Path to the attention_files directory, or None if no attention data.
     """
     import numpy as np
-    from openfold.model.evoformer import save_attention_topk
 
     if not collector.attention:
         return None
@@ -128,26 +134,46 @@ def write_attention_txt(
     attn_dir = os.path.join(out_dir, "attention_files")
     os.makedirs(attn_dir, exist_ok=True)
 
+    # Try to use OpenFold's implementation for format consistency;
+    # fall back to the self-contained version if openfold is not installed.
+    try:
+        from openfold.model.evoformer import save_attention_topk as _of_save
+
+        def _save(arr: "np.ndarray", layer_idx: int) -> None:
+            key = f"layer_{layer_idx:03d}"
+            _of_save(
+                attention_dict={key: arr},
+                save_dir=attn_dir,
+                layer_name=key,
+                layer_idx=layer_idx,
+                attn_type="msa_row_attn",
+                triangle_residue_idx=None,
+                top_k=top_k,
+            )
+
+    except ImportError:
+        # Standalone implementation — same output format as save_attention_topk.
+        # arr shape: [B, H, N, N]; msa_row_attn slices batch dim → [H, N, N].
+        def _save(arr: "np.ndarray", layer_idx: int) -> None:  # type: ignore[misc]
+            heads = arr[0]  # [H, N, N]
+            path = os.path.join(attn_dir, f"msa_row_attn_layer{layer_idx}.txt")
+            with open(path, "w") as f:
+                for head_idx, attn_map in enumerate(heads):
+                    S = attn_map.shape[0]
+                    k = min(top_k, S * S)
+                    flat = np.argsort(attn_map.flatten())[::-1][:k]
+                    rows, cols = np.unravel_index(flat, (S, S))
+                    scores = attn_map[rows, cols]
+                    f.write(f"Layer {layer_idx}, Head {head_idx}\n")
+                    for r, c, s in zip(rows, cols, scores):
+                        f.write(f"{r} {c} {s:.6f}\n")
+            print(f"[Done] Saved top {top_k} entries for msa_row_attn to {path}")
+
     for key, t in collector.attention.items():
-        # key format: "layer_000", "layer_001", ...
-        layer_idx = int(key.split("_")[-1])
-
-        # t shape: [B, H, N, N] — convert to numpy
+        m = re.search(r"\d+", key)
+        layer_idx = int(m.group()) if m else 0
         arr = t.float().cpu().numpy()
-
-        # save_attention_topk expects a dict with the array directly,
-        # shape (M, N, S, S) for msa_row_attn where M=batch, N=heads
-        attn_dict = {key: arr}
-
-        save_attention_topk(
-            attention_dict=attn_dict,
-            save_dir=attn_dir,
-            layer_name=key,
-            layer_idx=layer_idx,
-            attn_type="msa_row_attn",
-            triangle_residue_idx=None,
-            top_k=top_k,
-        )
+        _save(arr, layer_idx)
 
     return attn_dir
 
@@ -181,9 +207,9 @@ def write_trace_summary(
                 summary["attention"][layer_key] = {
                     "mean": float(block.mean()),
                     "std": float(block.std()),
-                    "entropy_proxy": float(ent),
+                "entropy_proxy": float(ent),
                     "sparsity_proxy": float((block < 1e-5).mean()),
-                }
+            }
     for key, t in collector.activations.items():
         h = t.float().cpu().numpy()
         if h.size == 0:
@@ -217,6 +243,15 @@ def build_and_write_meta(
     save_fp16: bool = False,
     top_k: int = 50,
 ) -> str:
+    # Determine which formats were actually produced
+    formats = []
+    if os.path.isdir(os.path.join(out_dir, "trace", "attention")):
+        formats.append("pt")
+    if os.path.isdir(os.path.join(out_dir, "attention_files")):
+        formats.append("txt")
+    if not formats:
+        formats = ["none"]
+
     meta = build_meta(
         backend="esmfold",
         model_name=model_name,
@@ -229,7 +264,7 @@ def build_and_write_meta(
         layer_count=layer_count,
         head_count=head_count,
         trace_mode=trace_mode,
-        trace_formats=["pt", "txt"],
+        trace_formats=formats,
         shapes_recorded=shapes_recorded,
         seed=seed,
         deterministic=deterministic,
