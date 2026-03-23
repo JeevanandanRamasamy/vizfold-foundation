@@ -81,7 +81,7 @@ def write_traces(
             t = t.index_select(head_dim, torch.tensor(head_indices, device=t.device))
         _save_tensor(path, t, save_fp16=save_fp16)
         attention_index[key] = {
-            "path": path,
+            "path": os.path.relpath(path, out_dir),
             "dtype": str(t.dtype),
             "shape": list(t.shape),
         }
@@ -90,7 +90,7 @@ def write_traces(
         path = os.path.join(act_dir, f"{key}.pt")
         _save_tensor(path, t, save_fp16=save_fp16)
         activations_index[key] = {
-            "path": path,
+            "path": os.path.relpath(path, out_dir),
             "dtype": str(t.dtype),
             "shape": list(t.shape),
         }

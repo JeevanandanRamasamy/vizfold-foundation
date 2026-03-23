@@ -226,10 +226,10 @@ class ESMFoldRunner:
                 shapes_recorded["activations"][k] = v.get("shape", [])
             try:
                 write_trace_summary(out_dir, collector)
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"Warning: trace summary failed: {e}")
 
-        layer_count = max(len(collector.attention), len(collector.activations), 1)
+        layer_count = len(collector.attention) if trace_mode != "none" else 0
         head_count = 0
         if collector.attention:
             first_attn = next(iter(collector.attention.values()))
